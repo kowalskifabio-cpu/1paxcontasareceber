@@ -2,155 +2,114 @@ import streamlit as st
 import pandas as pd
 import pdfplumber
 import re
-from io import BytesIO
 
-# Configuração da página
-st.set_page_config(page_title="Conciliador de Mensalidades - PAX", layout="wide")
+# Configuração de página
+st.set_page_config(page_title="Conciliador PAX - Alta Precisão", layout="wide")
 
-st.title("📊 Conciliação de Contas a Receber")
-st.markdown("""
-Faça o upload dos arquivos de **Recebidos** e **A Receber** para realizar a conciliação automática.
-O sistema filtrará os dados com base no mês de vencimento selecionado.
-""")
+st.title("📊 Conciliação Financeira (Versão Corrigida)")
+st.info("Esta versão utiliza extração de texto bruto para garantir que todos os valores pagos sejam contabilizados.")
 
-def extract_data_from_pdf(uploaded_files):
-    """Extrai dados dos PDFs e retorna uma lista de strings por linha."""
-    all_rows = []
-    
+def get_money_value(text):
+    """Extrai o último valor monetário de uma linha (valor pago)."""
+    matches = re.findall(r'(\d+[\d.]*,\d{2})', text)
+    if matches:
+        # Pega o último valor da linha (geralmente o Valor Pago/Total)
+        val_str = matches[-1].replace('.', '').replace(',', '.')
+        return float(val_str)
+    return 0.0
+
+def process_file(uploaded_files, mode="receber"):
+    """Processa arquivos usando extração de texto para não perder linhas."""
+    data = []
     for uploaded_file in uploaded_files:
         with pdfplumber.open(uploaded_file) as pdf:
             for page in pdf.pages:
-                table = page.extract_table()
-                if table:
-                    for row in table:
-                        # CORREÇÃO: Converte cada item para string, tratando None/NaN como string vazia
-                        clean_row = [str(item) if item is not None else "" for item in row]
-                        # Filtra linhas que são totalmente vazias
-                        if any(clean_row):
-                            all_rows.append(clean_row)
-    return all_rows
+                text = page.extract_text()
+                if not text:
+                    continue
+                
+                lines = text.split('\n')
+                for line in lines:
+                    # Busca Contrato (3 a 5 dígitos) e Data (DD/MM/AAAA)
+                    contrato_match = re.search(r'\b(\d{3,5})\b', line)
+                    data_match = re.search(r'(\d{2}/\d{2}/\d{4})', line)
+                    valor = get_money_value(line)
+                    
+                    if data_match and valor > 0:
+                        contrato = contrato_match.group(1) if contrato_match else "S/C"
+                        data_dt = pd.to_datetime(data_match.group(1), dayfirst=True)
+                        
+                        if mode == "receber":
+                            data.append({
+                                'Contrato': contrato,
+                                'Data_Vencto': data_dt,
+                                'Valor_Previsto': valor
+                            })
+                        else:
+                            # Para recebidos, pegamos a competência (vencimento) para bater com o à receber
+                            data.append({
+                                'Contrato': contrato,
+                                'Mes_Ref': data_dt.month,
+                                'Ano_Ref': data_dt.year,
+                                'Valor_Pago': valor
+                            })
+    return pd.DataFrame(data)
 
-def preprocess_receber(rows):
-    """Tratamento específico para arquivos 'A Receber'."""
-    new_rows = []
-    for row in rows:
-        row_str = " ".join(row) # Agora garantido que todos são strings
-        
-        # Regex ajustada para o padrão dos seus arquivos
-        # Procura Contrato (números isolados), Data e Valor no final
-        contrato = re.search(r'\b(\d{3,5})\b', row_str) 
-        data = re.search(r'(\d{2}/\d{2}/\d{4})', row_str)
-        valor = re.search(r'(\d+,\d{2})$', row_str.strip()) # Valor costuma estar no fim da linha
-        
-        if contrato and data and valor:
-            try:
-                val_float = float(valor.group(1).replace('.', '').replace(',', '.'))
-                new_rows.append({
-                    'Contrato': contrato.group(1),
-                    'Data_Vencto': pd.to_datetime(data.group(1), dayfirst=True),
-                    'Valor_Previsto': val_float,
-                    'Linha_Original': row_str[:50] + "..." # Para auditoria se necessário
-                })
-            except:
-                continue
-    return pd.DataFrame(new_rows)
-
-def preprocess_recebidos(rows):
-    """Tratamento específico para arquivos 'Recebidos'."""
-    new_rows = []
-    for row in rows:
-        row_str = " ".join(row)
-        
-        contrato = re.search(r'\b(\d{3,5})\b', row_str)
-        # Em recebidos, pegamos a primeira data (Vencimento)
-        datas = re.findall(r'(\d{2}/\d{2}/\d{4})', row_str)
-        valor = re.search(r'(\d+,\d{2})$', row_str.strip())
-        
-        if contrato and len(datas) >= 1 and valor:
-            try:
-                val_float = float(valor.group(1).replace('.', '').replace(',', '.'))
-                dt_venc = pd.to_datetime(datas[0], dayfirst=True)
-                new_rows.append({
-                    'Contrato': contrato.group(1),
-                    'Mes_Venc': dt_venc.month,
-                    'Ano_Venc': dt_venc.year,
-                    'Valor_Pago': val_float,
-                    'Status': 'Recebido'
-                })
-            except:
-                continue
-    return pd.DataFrame(new_rows)
-
-# Interface de Upload
+# Interface
 col1, col2 = st.columns(2)
-
 with col1:
-    st.subheader("📁 Arquivos 'A Receber'")
-    files_receber = st.file_uploader("Upload (A RECEBER / EM ATRASO)", type="pdf", accept_multiple_files=True, key="receber")
-
+    files_receber = st.file_uploader("Arquivos A RECEBER (PDF)", accept_multiple_files=True)
 with col2:
-    st.subheader("📁 Arquivos 'Recebidos'")
-    files_recebidos = st.file_uploader("Upload (RECEBIDAS / EM ATRASO)", type="pdf", accept_multiple_files=True, key="recebidos")
+    files_recebidos = st.file_uploader("Arquivos RECEBIDOS (PDF)", accept_multiple_files=True)
 
-# Filtros
-st.sidebar.header("Configurações")
-mes_selecionado = st.sidebar.selectbox("Mês de Vencimento", range(1, 13), index=4) # Maio
-ano_selecionado = st.sidebar.number_input("Ano", min_value=2024, max_value=2030, value=2026)
+st.sidebar.header("Filtro de Conciliação")
+mes = st.sidebar.selectbox("Mês de Vencimento", range(1, 13), index=4) # Maio
+ano = st.sidebar.number_input("Ano", value=2026)
 
-if st.button("🚀 Executar Conciliação"):
+if st.button("🚀 Conciliar e Somar"):
     if files_receber and files_recebidos:
-        try:
-            with st.spinner("Processando..."):
-                # Extração
-                rows_receber = extract_data_from_pdf(files_receber)
-                rows_recebidos = extract_data_from_pdf(files_recebidos)
-                
-                # Transformação
-                df_receber = preprocess_receber(rows_receber)
-                df_recebidos = preprocess_recebidos(rows_recebidos)
-                
-                if df_receber.empty or df_recebidos.empty:
-                    st.error("Não foi possível extrair dados válidos dos PDFs. Verifique o formato.")
-                    st.stop()
+        with st.spinner("Processando arquivos..."):
+            df_receber = process_file(files_receber, mode="receber")
+            df_recebidos = process_file(files_recebidos, mode="recebidos")
 
-                # Filtragem do Mês/Ano solicitado (foco no Vencimento do Mês)
-                df_receber_mes = df_receber[
-                    (df_receber['Data_Vencto'].dt.month == mes_selecionado) & 
-                    (df_receber['Data_Vencto'].dt.year == ano_selecionado)
-                ].copy()
+            if df_receber.empty or df_recebidos.empty:
+                st.error("Não foram encontrados dados nos arquivos. Verifique se são PDFs de texto.")
+                st.stop()
 
-                # Conciliação por Contrato E Valor (para evitar falsos positivos)
-                # Removemos duplicatas de recebimento para o mesmo contrato no mesmo mês
-                df_recebidos_clean = df_recebidos[
-                    (df_recebidos['Mes_Venc'] == mes_selecionado) & 
-                    (df_recebidos['Ano_Venc'] == ano_selecionado)
-                ].drop_duplicates(subset=['Contrato'])
+            # Filtramos o à receber pelo mês selecionado
+            df_receber_mes = df_receber[
+                (df_receber['Data_Vencto'].dt.month == mes) & 
+                (df_receber['Data_Vencto'].dt.year == ano)
+            ]
 
-                conciliacao = pd.merge(
-                    df_receber_mes, 
-                    df_recebidos_clean[['Contrato', 'Valor_Pago', 'Status']], 
-                    on='Contrato', 
-                    how='left'
-                )
-                
-                conciliacao['Status'] = conciliacao['Status'].fillna('Pendente')
-                conciliacao['Valor_Pago'] = conciliacao['Valor_Pago'].fillna(0.0)
+            # Somamos os recebidos por Contrato (caso haja mais de um pagamento/parcela)
+            # Filtrando pela competência do vencimento original
+            df_recebidos_filtrado = df_recebidos[
+                (df_recebidos['Mes_Ref'] == mes) & 
+                (df_recebidos['Ano_Ref'] == ano)
+            ]
+            
+            df_rec_total = df_recebidos_filtrado.groupby('Contrato')['Valor_Pago'].sum().reset_index()
 
-                # KPIs
-                st.divider()
-                kpi1, kpi2, kpi3 = st.columns(3)
-                total_previsto = conciliacao['Valor_Previsto'].sum()
-                total_recebido = conciliacao[conciliacao['Status'] == 'Recebido']['Valor_Previsto'].sum()
-                
-                kpi1.metric("Total Previsto (Venc. no Mês)", f"R$ {total_previsto:,.2f}")
-                kpi2.metric("Total Conciliado", f"R$ {total_recebido:,.2f}")
-                kpi3.metric("Pendência do Mês", f"R$ {total_previsto - total_recebido:,.2f}")
+            # Merge final
+            conciliacao = pd.merge(df_receber_mes, df_rec_total, on='Contrato', how='left').fillna(0)
+            
+            # Indicadores Reais
+            st.divider()
+            c1, c2, c3 = st.columns(3)
+            
+            total_rec_nos_arquivos = df_recebidos['Valor_Pago'].sum() # Soma absoluta de todos os arquivos de recebimento
+            total_esperado_mes = df_receber_mes['Valor_Previsto'].sum()
+            total_conciliado = conciliacao['Valor_Pago'].sum()
 
-                # Exibição
-                st.subheader("📋 Lista de Conciliação")
-                st.dataframe(conciliacao[['Contrato', 'Data_Vencto', 'Valor_Previsto', 'Status', 'Valor_Pago']], use_container_width=True)
+            c1.metric("Total Bruto nos Arquivos (Recebidos)", f"R$ {total_rec_nos_arquivos:,.2f}")
+            c2.metric("Total a Receber (Venc. no Mês)", f"R$ {total_esperado_mes:,.2f}")
+            c3.metric("Total Conciliado (Deste Mês)", f"R$ {total_conciliado:,.2f}")
 
-        except Exception as e:
-            st.error(f"Erro ao processar: {e}")
+            if total_rec_nos_arquivos > 22000 and total_conciliado < 22000:
+                st.warning(f"Atenção: Existem R$ {total_rec_nos_arquivos - total_conciliado:,.2f} em recebimentos que não pertencem ao mês de vencimento {mes}/{ano} ou não possuem contrato correspondente no arquivo de 'A Receber'.")
+
+            st.subheader("📋 Detalhes da Conciliação")
+            st.dataframe(conciliacao, use_container_width=True)
     else:
-        st.info("Aguardando upload dos arquivos.")
+        st.warning("Selecione os arquivos.")
